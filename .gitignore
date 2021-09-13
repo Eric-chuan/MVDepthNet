@@ -1,0 +1,7 @@
+/.vscode
+*.pyc
+*.pth.tar
+*.pkl
+train_log/
+fig/
+__pycache__
