@@ -96,9 +96,9 @@ def up_conv_layer(in_planes, out_planes, kernel_size=3, batchNorm=False):
                 bias=False),
             nn.LeakyReLU(0.1,inplace=True))
 
-def depth_layer(input_channels):
+def depth_layer(input_channels, out_channels=1):
     return nn.Sequential(
-        nn.Conv2d(input_channels, 1, 3, padding=1), nn.Sigmoid())
+        nn.Conv2d(input_channels, out_channels, 3, padding=1), nn.Sigmoid())
 
 def predict_flow(in_planes, out_planes = 1):
     return nn.Conv2d(in_planes,out_planes,kernel_size=3,stride=1,padding=1,bias=False)
@@ -240,9 +240,9 @@ class GetImgVolume(nn.Module):
         warped_left = image_differentiable_warping(left_img, left_proj, gt_proj, depth_sample) #(B, 3, Ndepth, H, W)
         warped_right = image_differentiable_warping(right_img, right_proj, gt_proj, depth_sample) #(B, 3, Ndepth, H, W)
 
-        costvolume = torch.sum(torch.abs(warped_right - warped_left), dim=1)  #(B, Ndepth, H, W)
+        # costvolume = torch.sum(torch.abs(warped_right - warped_left), dim=1)  #(B, Ndepth, H, W)
 
-        return costvolume
+        return warped_left, warped_right
 
 class GetImgCorrelation(nn.Module):
     """Initialization Stage Class"""
@@ -303,11 +303,11 @@ class GetImgCorrelation(nn.Module):
         warped_left = image_differentiable_warping(left_img, left_proj, gt_proj, depth_sample)    #(B, 3, Ndepth, H, W)
         warped_right = image_differentiable_warping(right_img, right_proj, gt_proj, depth_sample) #(B, 3, Ndepth, H, W)
 
-        correaltion = torch.mean((warped_right * warped_left), dim=1)  #(B, Ndepth, H, W)
+        # correaltion = torch.mean((warped_right * warped_left), dim=1)  #(B, Ndepth, H, W)
 
-        costvolume = torch.sum(torch.abs(warped_right - warped_left), dim=1)  #(B, Ndepth, H, W)
+        # costvolume = torch.sum(torch.abs(warped_right - warped_left), dim=1)  #(B, Ndepth, H, W)
 
-        return costvolume
+        return warped_left, warped_right
 
 
 class GetFeatureVolume(nn.Module):
@@ -369,9 +369,9 @@ class GetFeatureVolume(nn.Module):
         warped_left = feature_differentiable_warping(left_fea, left_proj, gt_proj, depth_sample) #(B, C, Ndepth, H, W)
         warped_right = feature_differentiable_warping(right_fea, right_proj, gt_proj, depth_sample) #(B, C, Ndepth, H, W)
 
-        costvolume = torch.sum(torch.abs(warped_right - warped_left), dim=1)  #(B, Ndepth, H, W)
+        # costvolume = torch.sum(torch.abs(warped_right - warped_left), dim=1)  #(B, Ndepth, H, W)
 
-        return costvolume
+        return warped_left, warped_right
 
 
 class GetFeatureCorrelation(nn.Module):
@@ -433,6 +433,6 @@ class GetFeatureCorrelation(nn.Module):
         warped_left = feature_differentiable_warping(left_fea, left_proj, gt_proj, depth_sample) #(B, C, Ndepth, H, W)
         warped_right = feature_differentiable_warping(right_fea, right_proj, gt_proj, depth_sample) #(B, C, Ndepth, H, W)
 
-        correaltion = torch.mean((warped_right * warped_left), dim=1)  #(B, Ndepth, H, W)
+        # correaltion = torch.mean((warped_right * warped_left), dim=1)  #(B, Ndepth, H, W)
 
-        return correaltion
+        return warped_left, warped_right

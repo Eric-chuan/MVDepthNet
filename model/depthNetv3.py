@@ -1,6 +1,7 @@
 '''
 a pytorch model to learn motion stereo
 '''
+from os import umask
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +20,9 @@ from .sublayers import *
 #     #MFN originally use bias true
 #     #AANet deform
 #     return DeformConv(in_planes,out_planes,kernel_size=kernel_size,stride=strides,padding=padding, dilation=1,groups=1,deformable_groups=1,bias=False)
+def upsample2d_as(inputs, target_as, mode="bilinear"):
+    _, _, h, w = target_as.size()
+    return F.interpolate(inputs, [h, w], mode=mode, align_corners=True)
 
 class depthNet(nn.Module):
     """docstring for depthNet"""
@@ -54,23 +58,28 @@ class depthNet(nn.Module):
         self.upconv4 = deconv_layer(256, 128, 3)                 #H / 8
         self.updisp4to3 = nn.ConvTranspose2d(1, 1, 4, 2, 1, bias=False)
         self.iconv4 = nn.ConvTranspose2d(385, 128, 3, 1, 1) #input upconv4 + conv3b + updisp4
-        self.disp3 = depth_layer(128)
+        self.disp3 = depth_layer(128, out_channels=2)
 
 
         self.upconv3 = deconv_layer(128, 64, 3)                #H / 4
         self.updisp3to2 = nn.ConvTranspose2d(1, 1, 4, 2, 1, bias=False)
         self.iconv3 = nn.ConvTranspose2d(322, 64, 3, 1, 1) #input upconv3 + conv2 + updisp3       （left right correlation）
-        self.disp2 = depth_layer(64)
+        self.disp2 = depth_layer(64, out_channels=2)
 
         self.upconv2 = deconv_layer(64, 32, 3)
         self.updisp2to1 = nn.ConvTranspose2d(1, 1, 4, 2, 1, bias=False)
         self.iconv2 = nn.ConvTranspose2d(162, 32, 3, 1, 1) #input upconv2 + conv1 + updisp2
-        self.disp1 = depth_layer(32)
+        self.disp1 = depth_layer(32, out_channels=2)
 
         self.upconv1 = deconv_layer(32, 16, 3)                #H / 2
         self.updisp1to0 = nn.ConvTranspose2d(1, 1, 4, 2, 1, bias=False)
         self.iconv1 = nn.ConvTranspose2d(24, 16, 3, 1, 1) #input upconv1 + updisp1 + left + right
         self.disp0 = depth_layer(16)
+
+        self.oafilterconv1 = nn.Conv2d(3, 3, 3, padding=1)
+        self.oafilterconv2 = nn.Conv2d(3, 3, 3, padding=1)
+        self.oafilterconv3 = nn.Conv2d(3, 3, 3, padding=1)
+        self.lrelu = nn.LeakyReLU(0.1,inplace=True)
 
         # initialize the weights in the net
         total_num = 0
@@ -94,6 +103,7 @@ class depthNet(nn.Module):
                     total_num += get_trainable_number(m.bias)
         print("model has %d trainable variables"%total_num)
         self.GetFeatureVolume = GetFeatureVolume(64)
+        self.GetImgVolume = GetImgVolume(64)
         self.GetFeatureCorrelation = GetFeatureCorrelation(64)
         self.GetImgCorrelation = GetImgCorrelation(64)
 
@@ -109,7 +119,8 @@ class depthNet(nn.Module):
         conv2_r = self.conv2(conv1_r)
         conv3a_r = self.conv3(conv2_r)
 
-        out_corr = self.GetFeatureCorrelation(conv3a_l, conv3a_r, left_proj, right_proj, gt_proj, self.device)  #B x Ndepth x H/8 x W/8
+        warped3a_l, warped3a_r = self.GetFeatureCorrelation(conv3a_l, conv3a_r, left_proj, right_proj, gt_proj, self.device)  #B x Ndepth x H/8 x W/8
+        out_corr = torch.mean((warped3a_l * warped3a_r), dim=1)  #(B, Ndepth, H, W)
         out_corr = self.corr_activation(out_corr)
         out_conv3a_redirl = self.conv_redir(conv3a_l)                                                           #B x 32 x H/8 x W/8
         out_conv3a_redirr = self.conv_redir(conv3a_r)
@@ -131,23 +142,50 @@ class depthNet(nn.Module):
         updisp4 = self.updisp4to3(disp4)                                                                         #B x 1 x H/8 x W/8
         iconv4 = self.iconv4(torch.cat((upconv4, updisp4, conv3b), 1))                                           #B x 385 x H/8 x W/8
 
-        disp3 = self.disp3(iconv4)                                                                               #B x 1 x H/8 x W/8
+        dm3 = self.disp3(iconv4)                                                                               #B x 2 x H/8 x W/8
+        disp3, mask3 = dm3[:,0,:,:].unsqueeze(1), dm3[:,1,:,:].unsqueeze(1)                                     #B x 1 x H/8 x W/8
         updisp3 = self.updisp3to2(disp3)                                                                         #B x 1 x H/4 x W/4
-        upconv3 = self.upconv3(iconv4)                                                                           #B x 64 x H/4 x W/4
-        costvolume3 = self.GetFeatureCorrelation(conv2_l, conv2_r, left_proj, right_proj, gt_proj, self.device, updisp3)  #B x 1 x H/4 x W/4
-        iconv3 = self.iconv3(torch.cat((upconv3, updisp3, conv2_l, conv2_r, costvolume3), 1))                             #B x 322 x H/4 x W/4
+        updisp3_interpolated = upsample2d_as(disp3, updisp3, mode="bilinear")
+        upmask3_interpolated = upsample2d_as(mask3, updisp3, mode = 'bilinear')
+        upmask3_interpolated = upmask3_interpolated
+        upconv3 = self.upconv3(iconv4)          #B x 64 x H/4 x W/4
+        left_image3, right_image3 = F.interpolate(left_image, scale_factor = 1. / 4, mode="bilinear", align_corners=False), \
+                                    F.interpolate(right_image, scale_factor = 1. / 4, mode="bilinear", align_corners=False)
+        warpedimg_l3, warpedimg_r3 = self.GetImgVolume(left_image3, right_image3, left_proj, right_proj, gt_proj, self.device, updisp3_interpolated)  #Bx3x1xH/4 x W/4
+        filteredwarpedimg_l3, filteredwarpedimg_r3 = self.lrelu(self.oafilterconv1(upmask3_interpolated * warpedimg_l3.squeeze())),\
+                                                     self.lrelu(self.oafilterconv1((1-upmask3_interpolated)*warpedimg_r3.squeeze())) #B x 3 x H/4 x W/4
+        filteredcostvolume3 = torch.mean((filteredwarpedimg_l3 * filteredwarpedimg_r3), dim=1).unsqueeze(1)
+        iconv3 = self.iconv3(torch.cat((upconv3, updisp3, conv2_l, conv2_r, filteredcostvolume3), 1))                             #B x 322 x H/4 x W/4
 
-        disp2 = self.disp2(iconv3)                                                                               #B x 1 x H/4 x W/4
+        dm2 = self.disp2(iconv3)                                                                               #B x 2 x H/4 x W/4
+        disp2, mask2 = dm2[:,0,:,:].unsqueeze(1), dm2[:,1,:,:].unsqueeze(1)                                     #B x 1 x H/8 x W/8
         updisp2 = self.updisp2to1(disp2)                                                                         #B x 1 x H/2 x W/2
+        updisp2_interpolated = upsample2d_as(disp2, updisp2, mode="bilinear")
+        upmask2_interpolated = upsample2d_as(mask2, updisp2, mode = 'bilinear')
+        upmask2_interpolated = upmask2_interpolated
         upconv2 = self.upconv2(iconv3)                                                                           #B x 32 x H/2 x W/2
-        costvolume2 = self.GetFeatureCorrelation(conv1_l, conv1_r, left_proj, right_proj, gt_proj, self.device, updisp2)  #B x 1 x H/2 x W/2
-        iconv2 = self.iconv2(torch.cat((upconv2, updisp2, conv1_l, conv1_r, costvolume2), 1))                             #B x 162 x H/2 x W/2
+        left_image2, right_image2 = F.interpolate(left_image, scale_factor = 1. / 2, mode="bilinear", align_corners=False), \
+                                    F.interpolate(right_image, scale_factor = 1. / 2, mode="bilinear", align_corners=False)
+        warpedimg_l2, warpedimg_r2 = self.GetImgVolume(left_image2, right_image2, left_proj, right_proj, gt_proj, self.device, updisp2_interpolated)  #Bx3x1xH/2 x W/2
+        filteredwarpedimg_l2, filteredwarpedimg_r2 = self.lrelu(self.oafilterconv2(upmask2_interpolated * warpedimg_l2.squeeze())),\
+                                                     self.lrelu(self.oafilterconv2((1-upmask2_interpolated)*warpedimg_r2.squeeze())) #B x 3 x H/2 x W/2
+        filteredcostvolume2 = torch.mean((filteredwarpedimg_l2 * filteredwarpedimg_r2), dim=1).unsqueeze(1)
+        iconv2 = self.iconv2(torch.cat((upconv2, updisp2, conv1_l, conv1_r, filteredcostvolume2), 1))                             #B x 162 x H/2 x W/2
 
-        disp1 = self.disp1(iconv2)                                                                                #B x 1 x H/2 x W/2
+        dm1 = self.disp1(iconv2)                                                                                #B x 2 x H/2 x W/2
+        disp1, mask1 = dm1[:,0,:,:].unsqueeze(1), dm1[:,1,:,:].unsqueeze(1)                                     #B x 1 x H/8 x W/8
         updisp1 = self.updisp1to0(disp1)                                                                          #B x 1 x H x W
+        updisp1_interpolated = upsample2d_as(disp1, updisp1, mode="bilinear")
+        upmask1_interpolated = upsample2d_as(mask1, updisp1, mode = 'bilinear')
+        upmask1_interpolated = upmask1_interpolated.repeat(1, 3, 1, 1)
         upconv1 = self.upconv1(iconv2)                                                                            #B x 16 x H x W
-        costvolume2 = self.GetImgCorrelation(left_image, right_image, left_proj, right_proj, gt_proj, self.device, updisp1)  #B x 1 x H x W
-        iconv1 = self.iconv1(torch.cat((upconv1, updisp1, left_image, right_image, costvolume2), 1))                        #B x 24 x H/2 x W/2
+        # left_image1, right_image1 = F.interpolate(left_image, scale_factor = 1. / 2, mode="bilinear", align_corners=False), \
+        #                             F.interpolate(right_image, scale_factor = 1. / 2, mode="bilinear", align_corners=False)
+        warpedimg_l1, warpedimg_r1 = self.GetImgVolume(left_image, right_image, left_proj, right_proj, gt_proj, self.device, updisp1_interpolated)  #Bx3x1xH x W
+        filteredwarpedimg_l1, filteredwarpedimg_r1 = self.lrelu(self.oafilterconv3(upmask1_interpolated * warpedimg_l1.squeeze())),\
+                                                     self.lrelu(self.oafilterconv3((1-upmask1_interpolated)*warpedimg_r1.squeeze())) #B x 3 x H x W
+        filteredcostvolume1 = torch.mean((filteredwarpedimg_l1 * filteredwarpedimg_r1), dim=1).unsqueeze(1)
+        iconv1 = self.iconv1(torch.cat((upconv1, updisp1, left_image, right_image, filteredcostvolume1), 1))                        #B x 24 x H x W
         # print((iconv1 != iconv1).any())
         disp0 = self.disp0(iconv1)
         disp0 = self.relu(disp0)
