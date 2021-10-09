@@ -54,7 +54,7 @@ class depthResBlock(nn.Module):
         x = self.convblock(x) + x
         tmp = self.lastconv(x)
         tmp = F.interpolate(tmp, scale_factor = scale * 2, mode="bilinear", align_corners=False)
-        tmp = self.sigmoid_func(tmp)
+        # tmp = self.sigmoid_func(tmp)
         disp = tmp[:, :1]
         mask = tmp[:, 1:]
         return disp, mask
@@ -111,12 +111,12 @@ class depthNet(nn.Module):
         self.upconv0 = deconv_layer(32, 32)                        #H / 2
         self.updisp1to0 = nn.ConvTranspose2d(1, 1, 4, 2, 1, bias=False)
         self.iconv0 = nn.ConvTranspose2d(39, 32, 3, 1, 1) #input upconv0 + left + right + updisp1
-        self.disp0 = depth_layer(32)
+        self.disp0 = depth_layer_with_mask(32)
         self.relu = nn.ReLU(inplace=False)
-        self.sigmoid_func = nn.Sigmoid()
 
         self.getwarpedimg = GetWarpedImg()
-        self.resblock1 = depthResBlock(13, c=150)
+        self.resblock0 = depthResBlock(13, c=150)
+        self.resblock1 = depthResBlock(14, c=150)
         self.resblock2 = depthResBlock(14, c=90)
         self.contextnet = Contextnet()
         self.unet = Unet()
@@ -193,30 +193,51 @@ class depthNet(nn.Module):
         updisp1_interpolated = 2 * upsample2d_as(disp1, updisp1, mode="bilinear")
         iconv0 = self.iconv0(torch.cat((upconv0, updisp1, left_image, right_image), 1))                          #B x 32 x H x W
         disp0 = self.disp0(iconv0)
+        disp0, mask0 = disp0[:,:1], disp0[:,1:]
+        # print(disp0[-1].max(), disp0[-1].min())
         # disp0 = self.sigmoid_func(disp0)
 
         if torch.any(torch.isnan(disp0)):
             print('exit nan elements disp out')
         # disp0 = self.relu(disp0)
         # return [disp0, disp1, disp2, disp3, disp4, disp5, disp6]
-        warpedLeft_img0, warpedRight_img0 = self.getwarpedimg(left_image, right_image, left_proj, right_proj, gt_proj, self.device, disp_sample=disp0)
+        warpedLeft_img0, warpedLeft_mask0, warpedRight_img0, warpedRight_mask0 = self.getwarpedimg(left_image, right_image, left_proj, right_proj, gt_proj, self.device, disp_sample=disp0)
+        warped0 = (warpedLeft_img0, warpedRight_img0)
+        valid_mask0 = (warpedLeft_mask0, warpedRight_mask0)
+        merged0 = (warpedLeft_img0 * mask0 + warpedRight_img0 * (1 - mask0)) * (warpedLeft_mask0 & warpedRight_mask0)\
+                  + warpedLeft_img0 * ~warpedRight_mask0 + warpedRight_img0 * ~warpedLeft_mask0
 
-        disp_res1, mask_res1 = self.resblock1(torch.cat((left_image, right_image, warpedLeft_img0, warpedRight_img0), dim=1), disp0, scale=2)
-        warpedLeft_img1, warpedRight_img1 = self.getwarpedimg(left_image, right_image, left_proj, right_proj, gt_proj, self.device, disp_sample=disp_res1)
-        merged1 = warpedLeft_img1 * mask_res1 + warpedRight_img1 * (1 - mask_res1)
+        disp_res1, mask_res1 = self.resblock1(torch.cat((left_image, right_image, warpedLeft_img0, warpedRight_img0, mask0), dim=1), disp0, scale=4)
+        # out_disp1 = self.sigmoid_func1(disp0 + disp_res1)
+        out_disp1 = torch.sigmoid(disp0 + disp_res1)
+        mask1 = torch.sigmoid(mask0+mask_res1)
+        warpedLeft_img1, warpedLeft_mask1, warpedRight_img1, warpedRight_mask1 = self.getwarpedimg(left_image, right_image, left_proj, right_proj, gt_proj, self.device, disp_sample=out_disp1)
+        warped1 = (warpedLeft_img1, warpedRight_img1)
+        valid_mask1 = (warpedLeft_mask1, warpedRight_mask1)
+        # merged1 = warpedLeft_img1 * mask1 + warpedRight_img1 * (1 - mask1)
+        merged1 = (warpedLeft_img1 * mask1 + warpedRight_img1 * (1 - mask1)) * (warpedLeft_mask1 & warpedRight_mask1)\
+                  + warpedLeft_img1 * ~warpedRight_mask1 + warpedRight_img1 * ~warpedLeft_mask1
 
-        disp_res2, mask_res2 = self.resblock2(torch.cat((left_image, right_image, warpedLeft_img1, warpedRight_img1, mask_res1), dim=1), disp_res1, scale=1)
-        warpedLeft_img2, warpedRight_img2 = self.getwarpedimg(left_image, right_image, left_proj, right_proj, gt_proj, self.device, disp_sample=disp_res2)
-        merged2 = warpedLeft_img2 * mask_res2 + warpedRight_img2 * (1 - mask_res2)
+        disp_res2, mask_res2 = self.resblock2(torch.cat((left_image, right_image, warpedLeft_img1, warpedRight_img1, mask1), dim=1), disp_res1, scale=2)
+        # out_disp2 = self.sigmoid_func2(out_disp1 + disp_res2)
+        out_disp2 = torch.sigmoid(out_disp1 + disp_res2)
+        mask2 = torch.sigmoid(mask1 + mask_res2)
+        warpedLeft_img2, warpedLeft_mask2, warpedRight_img2, warpedRight_mask2 = self.getwarpedimg(left_image, right_image, left_proj, right_proj, gt_proj, self.device, disp_sample=out_disp2)
+        warped2 = (warpedLeft_img2, warpedRight_img2)
+        valid_mask2 = (warpedLeft_mask2, warpedRight_mask2)
+        # merged2 = warpedLeft_img2 * mask2 + warpedRight_img2 * (1 - mask2)
+        merged2 = (warpedLeft_img2 * mask2 + warpedRight_img1 * (1 - mask2)) * (warpedLeft_mask2 & warpedRight_mask2) \
+                  + warpedLeft_img2 * ~warpedRight_mask2 + warpedRight_img2 * ~warpedLeft_mask2
 
         #refinement
-        c0 = self.contextnet(left_image, left_proj, gt_proj, disp_res2)
-        c1 = self.contextnet(right_image, right_proj, gt_proj, disp_res2)
-        unet_output = self.unet(left_image, right_image, warpedLeft_img2, warpedRight_img2, mask_res2, disp_res2, c0, c1)
+        c0 = self.contextnet(left_image, left_proj, gt_proj, out_disp2)
+        c1 = self.contextnet(right_image, right_proj, gt_proj, out_disp2)
+        unet_output = self.unet(left_image, right_image, warpedLeft_img2, warpedRight_img2, mask2, out_disp2, c0, c1)
         merged_unet = unet_output[:,:3] * 2 - 1
         merged_refine = torch.clamp(merged2 + merged_unet, 0, 1)
 
-        return [merged_refine, merged2, merged1], [disp_res2, disp_res1, disp0], [mask_res2, mask_res1]
+        return [merged_refine, merged2, merged1], [out_disp2, out_disp1, disp0], \
+               [mask2, mask1, mask0], [warped2, warped1, warped0], [valid_mask2, valid_mask1, valid_mask0]
 
 
 

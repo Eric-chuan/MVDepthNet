@@ -36,8 +36,8 @@ iterate_per_epoch = 0
 mini_batch_scale = 1  #so we have a minn-batch of 8 * 1 = 1
 best_loss_train = -1
 best_loss_validate = -1
-resume_train = True
-resume_train_path = 'train_log/models/checkpoint00100.pth.tar'
+resume_train = False
+resume_train_path = 'train_log/models/checkpoint00010.pth.tar'
 initialize_train = False
 initialize_train_path = ''
 lap_loss = LapLoss()
@@ -45,32 +45,87 @@ ssim_loss = SSIM()
 
 
 
+def compute_reconstr_loss(warped, ref, simple=True):
+    if simple:
+        return F.smooth_l1_loss(warped, ref, reduction='mean')
+    else:
+        alpha = 0.5
+        ref_dx, ref_dy = gradient(ref)
+        warped_dx, warped_dy = gradient(warped)
+        photo_loss = F.smooth_l1_loss(warped, ref, reduction='mean')
+        grad_loss = F.smooth_l1_loss(warped_dx, ref_dx, reduction='mean') + \
+                    F.smooth_l1_loss(warped_dy, ref_dy, reduction='mean')
+        return (1 - alpha) * photo_loss + alpha * grad_loss
 
-def loss_v3(pred_imgs, pred_depths, gt_img):
+def compute_warped_loss(warped, ref, valid_masks, simple=True):
+    if simple:
+        return F.smooth_l1_loss(warped*valid_masks, ref*valid_masks, reduction='mean')
+    else:
+        alpha = 0.5
+        ref_dx, ref_dy = gradient(ref*valid_masks)
+        warped_dx, warped_dy = gradient(warped*valid_masks)
+        photo_loss = F.smooth_l1_loss(warped*valid_masks, ref*valid_masks, reduction='mean')
+        grad_loss = F.smooth_l1_loss(warped_dx, ref_dx, reduction='mean') + \
+                    F.smooth_l1_loss(warped_dy, ref_dy, reduction='mean')
+        return (1 - alpha) * photo_loss + alpha * grad_loss
+
+def loss_v3(pred_imgs, pred_depths, warped_imgs, valid_masks, gt_img):
     loss_lap1 = lap_loss(pred_imgs[0], gt_img).mean()
     loss_lap2 = lap_loss(pred_imgs[1], gt_img).mean()
     loss_lap3 = lap_loss(pred_imgs[2], gt_img).mean()
+
+    l1_loss1 = torch.abs(gt_img - pred_imgs[0]).mean()
+    l1_loss2 = torch.abs(gt_img - pred_imgs[1]).mean()
+    l1_loss3 = torch.abs(gt_img - pred_imgs[2]).mean()
+
     loss_ssim1 = ssim_loss(pred_imgs[0], gt_img).mean()
     loss_ssim2 = ssim_loss(pred_imgs[1], gt_img).mean()
     loss_ssim3 = ssim_loss(pred_imgs[2], gt_img).mean()
 
+    reconstr_loss1 = compute_reconstr_loss(pred_imgs[0], gt_img, simple=False)
+    reconstr_loss2 = compute_reconstr_loss(pred_imgs[1], gt_img, simple=False)
+    reconstr_loss3 = compute_reconstr_loss(pred_imgs[2], gt_img, simple=False)
+
+    warped_loss1_1 = compute_warped_loss(warped_imgs[0][0], gt_img, valid_masks[0][0], simple=False)
+    warped_loss1_2 = compute_warped_loss(warped_imgs[0][1], gt_img, valid_masks[0][1], simple=False)
+    warped_loss2_1 = compute_warped_loss(warped_imgs[1][0], gt_img, valid_masks[1][0], simple=False)
+    warped_loss2_2 = compute_warped_loss(warped_imgs[1][1], gt_img, valid_masks[1][1], simple=False)
+    warped_loss3_1 = compute_warped_loss(warped_imgs[2][0], gt_img, valid_masks[2][0], simple=False)
+    warped_loss3_2 = compute_warped_loss(warped_imgs[2][1], gt_img, valid_masks[2][1], simple=False)
+
+    losswarped_ssim1_1 = ssim_loss(warped_imgs[0][0] * valid_masks[0][0], gt_img * valid_masks[0][0]).mean()
+    losswarped_ssim1_2 = ssim_loss(warped_imgs[0][1] * valid_masks[0][1], gt_img * valid_masks[0][1]).mean()
+    # losswarped_ssim1 = ssim_loss(warped_imgs[0][0], warped_imgs[0][1]).mean()
+
+
     for i in range(3):
         pred_depths[i] = dequantilization(pred_depths[i])
+
     smooth_loss1 = depth_smoothness(pred_depths[0], gt_img)
     smooth_loss2 = depth_smoothness(pred_depths[1], gt_img)
     smooth_loss3 = depth_smoothness(pred_depths[2], gt_img)
-    loss = 0.15*(loss_lap1+loss_lap2+loss_lap3) \
-           + 0.85*(loss_ssim1+loss_ssim2+loss_ssim3)\
-          + 0.5*(smooth_loss1+smooth_loss2+smooth_loss2)
+    # loss = 0.15*(loss_lap1+loss_lap2+loss_lap3) \
+    loss = 12*(reconstr_loss1+reconstr_loss2+reconstr_loss3) \
+           + 6*(loss_ssim1+loss_ssim2+loss_ssim3) \
+           + 0.1*(smooth_loss1+smooth_loss2) \
+           + 0.1*smooth_loss3\
+        #    + 6*(warped_loss1_1+warped_loss1_2+warped_loss2_1+warped_loss2_2+warped_loss3_1+warped_loss3_2) \
+        #    + 6*(losswarped_ssim1_1+losswarped_ssim1_2)
+    # print(reconstr_loss1,warped_loss1_1, smooth_loss3)
+    # (0.0042, 0.0040, 0.18)
+    # print(loss_lap1, l1_loss1, loss_ssim1)
+    # (0.0942, 0.0547, 0.1921)
     return loss
 
 
 def get_learning_rate(step):
     global epoch_num, iterate_per_epoch
-    if step < 1000:
-        mul = step / 1000.
+    thre_step = 300
+    if step < thre_step:
+        mul = step / thre_step
     else:
-        mul = np.cos((step - 1000) / (iterate_per_epoch * 1000 - 1000.) * math.pi) * 0.5 + 0.5
+        mul = np.cos((step - thre_step) / (iterate_per_epoch * 20 - thre_step) * math.pi) * 0.5 + 0.5
+    # mul = np.cos((step) / (iterate_per_epoch * 500) * math.pi) * 0.5 + 0.5
     return (1e-5 - 1e-6) * mul + 1e-6
 
 def main():
@@ -85,9 +140,9 @@ def main():
 
     # dataset_root = '/home/Eric-chuan/workspace/dataset/dataset_kitti'
     # dataset_train = KittiDataset(dataset_root, 'train')
-    # train_loader = DataLoader(dataset_train, batch_size=32, num_workers=4, pin_memory=True, drop_last=True)
+    # train_loader = DataLoader(dataset_train, batch_size=64, num_workers=4, pin_memory=True, drop_last=True)
     # dataset_val = KittiDataset(dataset_root, 'valid')
-    # validate_loader = DataLoader(dataset_val, batch_size=16, pin_memory=True, num_workers=4)
+    # validate_loader = DataLoader(dataset_val, batch_size=32, pin_memory=True, num_workers=4)
 
     train_writer = SummaryWriter(tensorboard_path)
     print('train data have %d pairs' % len(train_loader))
@@ -119,12 +174,12 @@ def main():
 
     # optimizer
     # optimizer = torch.optim.Adam(depthnet.parameters(), lr= 1e-6)
-    optimizer = torch.optim.AdamW(depthnet.parameters(), lr=1e-5, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(depthnet.parameters(), lr=1e-6, weight_decay=1e-4)
     optimizer.zero_grad()
 
 
     #start the epoch
-    while (epoch_num < 1000):
+    while (epoch_num < 500):
 
         loss_train = train_one_epoch(depthnet, train_loader, optimizer,
                                      train_writer)
@@ -198,12 +253,12 @@ def train_one_epoch(model, train_loader, optimizer, data_writer):
             param_group['lr'] = learning_rate
         # forward once
         forward_begin_time = time.time()
-        predict_imgs, predict_depths, masks = model(left_image_cuda, right_image_cuda,
+        predict_imgs, predict_depths, masks, warped_imgs, valid_masks = model(left_image_cuda, right_image_cuda,
                                left_proj_cuda, right_proj_cuda, gt_proj_cuda)
         average_forwardtime.update(time.time() - forward_begin_time)
         # get the loss
         loss_begin_time = time.time()
-        loss = loss_v3(predict_imgs, predict_depths, gt_image_cuda)
+        loss = loss_v3(predict_imgs, predict_depths, warped_imgs, valid_masks, gt_image_cuda)
         # loss = build_v3soothloss_with_mask(predict_depths, depth_image_cuda)
         loss_float = loss.item()
         loss = loss / mini_batch_scale
@@ -238,17 +293,28 @@ def train_one_epoch(model, train_loader, optimizer, data_writer):
             average_losstime.reset()
             average_iterate.reset()
         if iterate_num % 5 == 0:
-            print(predict_depths[0][-1].max(), predict_depths[0][-1].min())
+            # print(predict_depths[2][-1].max(), predict_depths[2][-1].min())
             PredictDepth1 = ((predict_depths[0][-1] * 255.).detach().cpu().numpy()).astype('uint8')
+            PredictDepth2 = ((predict_depths[1][-1] * 255.).detach().cpu().numpy()).astype('uint8')
+            PredictDepth3 = ((predict_depths[2][-1] * 255.).detach().cpu().numpy()).astype('uint8')
             GTDepth = quantilization(depth_image_cuda[-1].detach().cpu().numpy()).astype('uint8')
             PredictImage1 =  (predict_imgs[0][-1].detach().cpu().numpy()[[2, 1, 0], :, :] * 255).astype('uint8')
+            PredictImage2 =  (predict_imgs[1][-1].detach().cpu().numpy()[[2, 1, 0], :, :] * 255).astype('uint8')
+            PredictImage3 =  (predict_imgs[2][-1].detach().cpu().numpy()[[2, 1, 0], :, :] * 255).astype('uint8')
             GTImage = (gt_image_cuda[-1].detach().cpu().numpy()[[2, 1, 0], :, :] * 255).astype('uint8')
-            mask = ((masks[0][-1] * 255.).detach().cpu().numpy()).astype('uint8')
-            depths = np.concatenate((GTDepth, PredictDepth1), axis=1)
-            images = np.concatenate((GTImage, PredictImage1), axis=1)
+            mask1 = ((masks[0][-1] * 255.).detach().cpu().numpy()).astype('uint8')
+            mask2 = ((masks[1][-1] * 255.).detach().cpu().numpy()).astype('uint8')
+            mask3 = ((masks[2][-1] * 255.).detach().cpu().numpy()).astype('uint8')
+            warped_img1 = (warped_imgs[0][0][-1].detach().cpu().numpy()[[2, 1, 0], :, :] * 255).astype('uint8')
+            warped_img2 = (warped_imgs[0][1][-1].detach().cpu().numpy()[[2, 1, 0], :, :] * 255).astype('uint8')
+            depths = np.concatenate((GTDepth, PredictDepth1, PredictDepth2, PredictDepth3), axis=1)
+            images = np.concatenate((GTImage, PredictImage1, PredictImage2, PredictImage3), axis=1)
+            masks = np.concatenate((mask1, mask2, mask3), axis=1)
+            warped_img = np.concatenate((warped_img1, warped_img2), axis=1)
             data_writer.add_image('train/Depth', depths, iterate_num)
             data_writer.add_image('train/Image', images, iterate_num)
-            data_writer.add_image('train/Mask', mask, iterate_num)
+            data_writer.add_image('train/Mask', masks, iterate_num)
+            data_writer.add_image('train/Warped', warped_img, iterate_num)
 
         # if iterate_num % 10 == 0:
         #     cv2.imwrite('DepthGT.png', quantilization(depth_image_cuda[-1].detach().cpu().numpy().transpose(1, 2, 0)).astype('uint8'))
@@ -305,14 +371,14 @@ def vaild_one_epoch(model, vaild_loader, data_writer):
 
         # forward once
         forward_begin_time = time.time()
-        predict_imgs, predict_depths, masks = model(left_image_cuda, right_image_cuda,
+        predict_imgs, predict_depths, masks, warped_imgs, valid_masks = model(left_image_cuda, right_image_cuda,
                                left_proj_cuda, right_proj_cuda, gt_proj_cuda)
         forward_time = time.time() - forward_begin_time
         average_forwardtime.update(forward_time)
 
         # get the loss
         # loss = build_v3loss_with_mask(predict_depths, depth_image_cuda)
-        loss = loss_v3(predict_imgs, predict_depths, gt_image_cuda)
+        loss = loss_v3(predict_imgs, predict_depths, warped_imgs, valid_masks, gt_image_cuda)
         loss_float = loss.item()
 
         loss_vector.append(loss_float)
